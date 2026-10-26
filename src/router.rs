@@ -112,6 +112,17 @@ impl SocketSend for RouterSocket {
 }
 
 impl RouterSocket {
+    /// Sends like [`SocketSend::send`], but returns [`ZmqError::BufferFull`]
+    /// instead of waiting when the destination peer queue is full or another
+    /// send to that peer is pending.
+    ///
+    /// Use it when one task serves many peers: awaiting `send` there lets one
+    /// peer that is not reading stall the others. This matches libzmq
+    /// `ZMQ_ROUTER_MANDATORY` with `ZMQ_DONTWAIT`.
+    pub async fn try_send(&self, message: ZmqMessage) -> ZmqResult<()> {
+        try_route(&self.backend, message).await
+    }
+
     /// Splits the socket into separate send and recv halves, allowing concurrent
     /// sending and receiving from independent async tasks.
     ///
@@ -159,6 +170,25 @@ impl Drop for RouterSocketInner {
 #[derive(Clone)]
 pub struct RouterSendHalf {
     inner: Arc<RouterSocketInner>,
+}
+
+impl RouterSendHalf {
+    /// See [`RouterSocket::try_send`].
+    pub async fn try_send(&self, message: ZmqMessage) -> ZmqResult<()> {
+        try_route(&self.inner.backend, message).await
+    }
+}
+
+async fn try_route(backend: &GenericSocketBackend, mut message: ZmqMessage) -> ZmqResult<()> {
+    if message.len() <= 1 {
+        return Err(ZmqError::Socket(
+            "ROUTER send requires at least 2 frames: identity frame + message",
+        ));
+    }
+    let peer_id: PeerIdentity = message.pop_front().unwrap().try_into()?;
+    backend
+        .try_send_to_peer(&peer_id, Message::Message(message))
+        .await
 }
 
 /// The recv half of a [`RouterSocket`] produced by [`RouterSocket::split`].

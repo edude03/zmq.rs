@@ -21,6 +21,7 @@ use std::sync::Arc;
 /// Sender for notifying reconnection tasks when a peer disconnects.
 pub(crate) type DisconnectNotifier = mpsc::Sender<PeerIdentity>;
 const PEER_SEND_QUEUE_CAPACITY: usize = 100_000;
+const PEER_QUEUE_BUSY: &str = "Peer send queue is full or another send to the peer is pending";
 
 type PeerSendQueue = Arc<AsyncMutex<mpsc::Sender<Message>>>;
 
@@ -193,6 +194,45 @@ impl GenericSocketBackend {
             Err(e) => {
                 self.peer_disconnected_if_current(peer_id, &send_queue);
                 Err(e.into())
+            }
+        }
+    }
+
+    /// Like [`Self::send_to_peer`], but fails with [`ZmqError::BufferFull`]
+    /// instead of waiting for queue capacity or for another send to the peer.
+    pub(crate) async fn try_send_to_peer(
+        &self,
+        peer_id: &PeerIdentity,
+        message: Message,
+    ) -> ZmqResult<()> {
+        let message = match self.try_send_cached_single_peer(message, Some(peer_id)) {
+            CachedSend::Sent => return Ok(()),
+            CachedSend::Pending { .. } => return Err(ZmqError::BufferFull(PEER_QUEUE_BUSY)),
+            CachedSend::Disconnected {
+                peer_id,
+                send_queue,
+                error,
+            } => {
+                self.peer_disconnected_if_current(&peer_id, &send_queue);
+                return Err(error.into());
+            }
+            CachedSend::Miss(message) => message,
+        };
+
+        let send_queue = match self
+            .peers
+            .read_async(peer_id, |_, peer| peer.send_queue.clone())
+            .await
+        {
+            Some(send_queue) => send_queue,
+            None => return Err(ZmqError::Other("Destination client not found by identity")),
+        };
+        match try_send_to_peer_queue(&send_queue, message) {
+            QueueSend::Sent => Ok(()),
+            QueueSend::Pending(_) => Err(ZmqError::BufferFull(PEER_QUEUE_BUSY)),
+            QueueSend::Disconnected(error) => {
+                self.peer_disconnected_if_current(peer_id, &send_queue);
+                Err(error.into())
             }
         }
     }
@@ -402,7 +442,7 @@ mod tests {
     use crate::ZmqMessage;
 
     use bytes::Bytes;
-    use futures::StreamExt;
+    use futures::{FutureExt, StreamExt};
     use std::time::Duration;
 
     fn message_with_frame(frame: &'static [u8]) -> Message {
@@ -428,6 +468,93 @@ mod tests {
         backend.refresh_single_peer_cache();
         backend.round_robin.push(peer_id.clone());
         (peer_id, recv_queue)
+    }
+
+    async fn insert_full_peer(
+        backend: &GenericSocketBackend,
+        peer_id: PeerIdentity,
+    ) -> (PeerIdentity, mpsc::Receiver<Message>) {
+        let (mut send_queue, recv_queue) = mpsc::channel(0);
+        send_queue
+            .try_send(message_with_frame(b"prefilled"))
+            .expect("prefill peer queue");
+        backend
+            .peers
+            .upsert_async(peer_id.clone(), Peer::new(send_queue))
+            .await;
+        backend.refresh_single_peer_cache();
+        backend.round_robin.push(peer_id.clone());
+        (peer_id, recv_queue)
+    }
+
+    #[crate::async_rt::test]
+    async fn test_try_send_to_peer_fails_instead_of_waiting_when_cached_peer_is_full() {
+        let backend =
+            GenericSocketBackend::with_options(None, SocketType::ROUTER, SocketOptions::default());
+        let (peer_id, _recv_queue) =
+            insert_full_peer(&backend, "slow-peer".parse().expect("peer id")).await;
+        assert!(backend.single_peer.lock().is_some());
+
+        let error = backend
+            .try_send_to_peer(&peer_id, message_with_frame(b"dropped"))
+            .now_or_never()
+            .expect("try_send must not wait on a full peer queue")
+            .expect_err("full peer queue should reject the message");
+
+        assert!(matches!(error, ZmqError::BufferFull(PEER_QUEUE_BUSY)));
+        // A slow peer is still a connected peer.
+        assert!(backend.peers.get_async(&peer_id).await.is_some());
+    }
+
+    #[crate::async_rt::test]
+    async fn test_try_send_to_full_peer_does_not_block_other_peers() {
+        let backend =
+            GenericSocketBackend::with_options(None, SocketType::ROUTER, SocketOptions::default());
+        let (slow_peer_id, _slow_recv_queue) =
+            insert_full_peer(&backend, "slow-peer".parse().expect("peer id")).await;
+        let (other_peer_id, mut other_recv_queue) =
+            insert_peer(&backend, "other-peer".parse().expect("peer id")).await;
+        assert!(backend.single_peer.lock().is_none());
+
+        let error = backend
+            .try_send_to_peer(&slow_peer_id, message_with_frame(b"dropped"))
+            .now_or_never()
+            .expect("try_send must not wait on a full peer queue")
+            .expect_err("full peer queue should reject the message");
+        assert!(matches!(error, ZmqError::BufferFull(PEER_QUEUE_BUSY)));
+        assert!(backend.peers.get_async(&slow_peer_id).await.is_some());
+
+        backend
+            .try_send_to_peer(&other_peer_id, message_with_frame(b"delivered"))
+            .now_or_never()
+            .expect("try_send to a peer with space must not wait")
+            .expect("send to other peer");
+        let queued = other_recv_queue.next().await.expect("queued message");
+        assert_eq!(Bytes::from_static(b"delivered"), first_frame(queued));
+    }
+
+    #[crate::async_rt::test]
+    async fn test_try_send_to_peer_fails_while_another_send_holds_the_peer() {
+        let backend =
+            GenericSocketBackend::with_options(None, SocketType::ROUTER, SocketOptions::default());
+        let (first_peer_id, _first_recv_queue) =
+            insert_peer(&backend, "busy-peer".parse().expect("peer id")).await;
+        let (_second_peer_id, _second_recv_queue) =
+            insert_peer(&backend, "other-peer".parse().expect("peer id")).await;
+        let send_queue = backend
+            .peers
+            .read_async(&first_peer_id, |_, peer| peer.send_queue.clone())
+            .await
+            .expect("peer");
+        let _pending_send = send_queue.lock().await;
+
+        let error = backend
+            .try_send_to_peer(&first_peer_id, message_with_frame(b"dropped"))
+            .now_or_never()
+            .expect("try_send must not wait for another send to the peer")
+            .expect_err("a held peer queue should reject the message");
+
+        assert!(matches!(error, ZmqError::BufferFull(PEER_QUEUE_BUSY)));
     }
 
     #[crate::async_rt::test]
